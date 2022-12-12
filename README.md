@@ -2,6 +2,8 @@
 
 ## Usage
 
+Run `./sync-all` if have [zx](https://github.com/google/zx) installed that contain cloning, updating and deleting local repositories that not exists on remove (when passing `--rm` or `--remove-missing`)
+
 Run `clone-app.sh` to clone all (up to 1000) repos of your company (and update them locally if exists)
 
 Run `update-all.sh` to update locally all the repos of your company

@@ -1,0 +1,237 @@
+#!/usr/bin/env zx --experimental
+/* vim: syntax=javascript
+ */
+
+// Help:
+// -d, --dir: clone directory
+// -u, --user: user/org to clone from
+// -rm, --remove-missing: remove folders that don't exists in the user
+
+const dir = argv.d || argv.dir;
+const user = argv.u || argv.user || "<set-company-name-here>";
+const removeMissing = getBooleanArg(["rm", "remove-missing"]);
+
+if (user === "<set-company-name-here>") {
+  console.log(
+    chalk.red(
+      "You must pass user/org to be the username of the company on GitHub by -u, --user or update this file"
+    )
+  );
+  process.exit(1);
+}
+
+if (!dir) {
+  const folderName = `all-projects-in-${user}-for-better-search`;
+  console.log(
+    `No arguments supplied, cloning/updating all projects to '${folderName}'`
+  );
+
+  await $`mkdir -p "./${folderName}"`;
+  cd(`./${folderName}`);
+} else {
+  console.log(`Target folder passed, Cloning all projects to ${dir}`);
+  cd(dir);
+}
+
+const { stdout: ogDirRaw } = await $`pwd`;
+const ogDir = ogDirRaw.trim();
+console.log(`Cloning to ${ogDir}`);
+
+// Not verbose as it may be too big
+$.verbose = false;
+const { stdout: githubProjectsRaw } =
+  await $`gh repo list ${user} --limit 1000`;
+$.verbose = true;
+
+// Line example:
+// bringg/node-arnavmq\tArnavMQ is an amqp.node wrapper to ease common AMQP usages (RPC, pub/sub, channel/connection handling etc...)\tpublic\t2022-12-12T09:05:03Z\n
+const githubProjects = githubProjectsRaw
+  .split("\n")
+  .filter(Boolean)
+  .map((project) => {
+    const fullName = project.split("\t")[0];
+    const folderName = fullName.split("/")[1];
+
+    return {
+      fullName,
+      folderName,
+      fullPath: path.join(ogDir, folderName),
+    };
+  });
+
+for (const project of githubProjects) {
+  console.log("");
+  console.log("");
+  console.log(chalk.bold(project.fullName));
+  console.log("-".repeat(project.fullName.length));
+  console.log(`Checking existence of ${project.folderName}`);
+
+  const folderExists = await isFolderExist(project.fullPath);
+  if (folderExists) {
+    console.log("Repo found, updating...");
+    await updateGitRepo(project.fullName, project.fullPath);
+  } else {
+    console.log("Repo not found, cloning...");
+    await cloneGitRepo(project);
+  }
+}
+
+const currentFolders = new Set(
+  await glob(["*"], {
+    deep: 1,
+    absolute: true,
+    onlyDirectories: true,
+    cwd: ogDir,
+  })
+);
+githubProjects.forEach(({ fullPath }) => {
+  currentFolders.delete(fullPath);
+});
+
+if (currentFolders.size > 0) {
+  console.log(`Found ${currentFolders.size} folders that missing from github`);
+
+  if (!removeMissing) {
+    console.log(
+      "To remove them next time use the `-rm` or the `--remove-missing` flag"
+    );
+  }
+}
+
+if (removeMissing) {
+  for (const folderToDelete of currentFolders) {
+    try {
+      await $`rm -r ${folderToDelete}`;
+    } catch (e) {
+      console.log(chalk.red(`Failed to delete ${folderToDelete}, skipping...`));
+
+      console.error(e);
+    }
+  }
+}
+
+function getBooleanArg(keys, defaultValue = false) {
+  const value = keys.reduce((current, key) => {
+    if (typeof current === "boolean") {
+      return current;
+    }
+
+    if (argv[key] === undefined) {
+      return current;
+    }
+
+    if (typeof argv[key] === "boolean") {
+      return argv[key];
+    }
+
+    if (typeof argv[key] === "string") {
+      return argv[key] === "true";
+    }
+
+    return current;
+  }, undefined);
+
+  return value ?? defaultValue;
+}
+
+async function isFolderExist(folder) {
+  try {
+    await fs.promises.access(folder);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function updateGitRepo(projectName, folderPath) {
+  await within(async () => {
+    cd(folderPath);
+
+    try {
+      console.log();
+      console.log(`[${projectName}] Restoring changes if have any`);
+      await $`git restore .`;
+    } catch (e) {
+      console.log(
+        chalk.red(
+          `[${projectName}] Failed to restore current changes, continue without...`
+        ),
+        e.message
+      );
+    }
+
+    try {
+      console.log();
+      console.log(
+        `[${projectName}] Update repo and remove remote tracking branches / tags that was removed`
+      );
+      await $`git pull --prune --no-tags --ff-only`;
+    } catch (e) {
+      console.log(
+        chalk.red(`[${projectName}] Failed to update repo, skipping...`),
+        e.message
+      );
+
+      return;
+    }
+
+    try {
+      console.log();
+      console.log(
+        `[${projectName}] Remove Local branches that does not exist on the remote`
+      );
+      await $`git fetch -p && for branch in $(git branch -vv | grep ': gone]' | awk '{print $1}'); do git branch -D $branch; done`;
+    } catch (e) {
+      console.log(
+        chalk.red(
+          `[${projectName}] Failed to remove local branches that not exists in the remote, skipping...`
+        ),
+        e.message
+      );
+
+      return;
+    }
+  });
+}
+
+async function cloneGitRepo({ fullName, fullPath }) {
+  try {
+    await $`gh repo clone ${fullName}`;
+  } catch (e) {
+    console.log(
+      "###########################\n" +
+        chalk.red(`Failed to clone ${fullName}, skipping...`) +
+        "\n" +
+        "###########################"
+    );
+
+    console.error(e);
+
+    return;
+  }
+
+  await within(async () => {
+    cd(fullPath);
+
+    try {
+      console.log("checking if have git submodules");
+
+      const { stdout: status } = await $`git submodule status --recursive`;
+
+      if (status.length === 0) {
+        // no git submodule
+        return;
+      }
+
+      print(`${fullName} Have submodule, init...`);
+      await $`git submodule update --init --recursive`;
+    } catch (e) {
+      console.log(
+        chalk.red(
+          `Failed to check/update git sub module repo ${fullName}, skipping...`
+        ),
+        e
+      );
+    }
+  });
+}
