@@ -2,14 +2,35 @@
 /* vim: syntax=javascript
  */
 
-// Help:
-// -d, --dir: clone directory
-// -u, --user: user/org to clone from
-// -rm, --remove-missing: remove folders that don't exists in the user
+const help = `
+Sync all project in particular folder:
+
+  -h,  --help: print this help
+  -d,  --dir: clone directory
+  -u,  --user: user/org to clone from
+       --allow-other-branches: do not force every repo to be on the default git branch
+  -s,  --serial: update/clone one after the other
+  -rm, --remove-missing: remove folders that don't exists in the user
+  -q,  --quiet: lower the amount of logs
+`;
 
 const dir = argv.d || argv.dir;
 const user = argv.u || argv.user || "<set-company-name-here>";
+const printHelp = getBooleanArg(["h", "help"], false);
 const removeMissing = getBooleanArg(["rm", "remove-missing"]);
+const allowOtherBranches = getBooleanArg(["allow-other-branches"], false);
+const serial = getBooleanArg(["s", "serial"], false);
+const quiet = getBooleanArg(["q", "quiet"], !$.verbose);
+
+const verbose = !quiet;
+$.verbose = verbose;
+
+if (printHelp) {
+  console.log(help);
+
+  process.exit(0);
+}
+
 
 if (user === "<set-company-name-here>") {
   console.log(
@@ -41,7 +62,7 @@ console.log(`Cloning to ${ogDir}`);
 $.verbose = false;
 const { stdout: githubProjectsRaw } =
   await $`gh repo list ${user} --limit 1000`;
-$.verbose = true;
+$.verbose = verbose;
 
 // Line example:
 // bringg/node-arnavmq\tArnavMQ is an amqp.node wrapper to ease common AMQP usages (RPC, pub/sub, channel/connection handling etc...)\tpublic\t2022-12-12T09:05:03Z\n
@@ -59,22 +80,81 @@ const githubProjects = githubProjectsRaw
     };
   });
 
-for (const project of githubProjects) {
-  console.log("");
-  console.log("");
-  console.log(chalk.bold(project.fullName));
-  console.log("-".repeat(project.fullName.length));
-  console.log(`Checking existence of ${project.folderName}`);
+async function runOnProject(project, i) {
+  if (verbose) {
+    console.log("");
+    console.log("");
+    const title = `[${i}/${githubProjects.length}] ${project.fullName}`;
+    console.log(chalk.bold(title));
+    console.log("-".repeat(title));
+    console.log(`Checking existence of ${project.folderName}`);
+  }
 
   const folderExists = await isFolderExist(project.fullPath);
   if (folderExists) {
-    console.log("Repo found, updating...");
-    await updateGitRepo(project.fullName, project.fullPath);
+    verbose && console.log("Repo found, updating...");
+    return await updateGitRepo(project.fullName, project.fullPath);
+  }
+
+  verbose && console.log("Repo not found, cloning...");
+  return await cloneGitRepo(project);
+}
+
+async function run() {
+  const failedProjects = [];
+
+  if (serial) {
+    let i = 0;
+    for (const project of githubProjects) {
+      const errorMessage = await runOnProject(project, i++);
+
+      if (typeof errorMessage === "string") {
+        failedProjects.push({ project, errorMessage });
+      }
+    }
   } else {
-    console.log("Repo not found, cloning...");
-    await cloneGitRepo(project);
+    await Promise.all(
+      githubProjects.map((project, i) =>
+        runOnProject(project, i).then((errorMessage) => {
+          if (typeof errorMessage === "string") {
+            failedProjects.push({ project, errorMessage });
+          }
+        })
+      )
+    );
+  }
+
+  if (failedProjects.length > 0) {
+    logFailures(failedProjects);
   }
 }
+
+function buildFailedRow(failedProject, index) {
+  return `${index}. ${chalk.bold(failedProject.fullName)} `;
+}
+
+function logFailures(failedProjects) {
+  const title = "Failed projects are:";
+  console.log(chalk.bold(chalk.red(title)));
+  console.log("-".repeat(title));
+
+  const maxPrefixLength = Math.max(
+    ...failedProjects.map(({ project }, i) => buildFailedRow(project, i).length)
+  );
+
+  for (let i = 0; i < failedProjects.length; i++) {
+    const prefix = buildFailedRow(failedProjects[i].project, i);
+    console.log(
+      chalk.red(
+        `${prefix}${" ".repeat(maxPrefixLength - prefix.length)}${
+          failedProjects[i].errorMessage
+        }`
+      )
+    );
+  }
+}
+
+await run();
 
 const currentFolders = new Set(
   await glob(["*"], {
@@ -99,9 +179,25 @@ if (currentFolders.size > 0) {
 }
 
 if (removeMissing) {
+  const commandToDelete = await which("trash").catch(async () => {
+    verbose && console.warn("trash command is missing (shame)");
+
+    await confirm("Use rm -rf instead?", {
+      exitOnNo: true,
+      onNo() {
+        console.log(
+          "The folders that should have been deleted:",
+          currentFolders
+        );
+      },
+    });
+
+    return "rm -rf";
+  });
+
   for (const folderToDelete of currentFolders) {
     try {
-      await $`rm -r ${folderToDelete}`;
+      await $`${commandToDelete} ${folderToDelete}`;
     } catch (e) {
       console.log(chalk.red(`Failed to delete ${folderToDelete}, skipping...`));
 
@@ -144,53 +240,115 @@ async function isFolderExist(folder) {
 }
 
 async function updateGitRepo(projectName, folderPath) {
-  await within(async () => {
+  return await within(async () => {
     cd(folderPath);
 
-    try {
-      console.log();
-      console.log(`[${projectName}] Restoring changes if have any`);
-      await $`git restore .`;
-    } catch (e) {
-      console.log(
-        chalk.red(
-          `[${projectName}] Failed to restore current changes, continue without...`
-        ),
-        e.message
-      );
-    }
+    return runSteps({ projectName }, [
+      {
+        description: "Checking if on the default branch",
+        skip: allowOtherBranches,
+        skipFlag: "--allow-other-branches",
+        steps: [
+          {
+            description: "Getting current branch",
+            errorMessageOnFailure: "Failed getting current branch",
 
-    try {
-      console.log();
-      console.log(
-        `[${projectName}] Update repo and remove remote tracking branches / tags that was removed`
-      );
-      await $`git pull --prune --no-tags --ff-only`;
-    } catch (e) {
-      console.log(
-        chalk.red(`[${projectName}] Failed to update repo, skipping...`),
-        e.message
-      );
+            fn: async (context) => {
+              const { stdout: currentBranch } =
+                await $`git rev-parse --abbrev-ref HEAD`;
 
-      return;
-    }
+              context.currentBranch = currentBranch.trim();
+            },
+          },
+          {
+            description: "Getting default branch",
+            errorMessageOnFailure: "Failed getting default branch",
+            fn: async (context) => {
+              const { stdout: defaultBranch } =
+                await $`git symbolic-ref refs/remotes/origin/HEAD`;
 
-    try {
-      console.log();
-      console.log(
-        `[${projectName}] Remove Local branches that does not exist on the remote`
-      );
-      await $`git fetch -p && for branch in $(git branch -vv | grep ': gone]' | awk '{print $1}'); do git branch -D $branch; done`;
-    } catch (e) {
-      console.log(
-        chalk.red(
-          `[${projectName}] Failed to remove local branches that not exists in the remote, skipping...`
-        ),
-        e.message
-      );
+              context.defaultBranch = defaultBranch
+                .trim()
+                .replace(/^refs\/remotes\/origin\//g, "");
+            },
+          },
 
-      return;
-    }
+          function assertCurrentBranchIsTheDefaultBranch({
+            currentBranch,
+            defaultBranch,
+          }) {
+            if (defaultBranch !== currentBranch) {
+              throw new Error(
+                `Currently on '${currentBranch}' and not on '${defaultBranch}' which is the default branch`
+              );
+            }
+          },
+        ],
+      },
+
+      {
+        description: "Restoring changes if have any",
+        errorMessageOnFailure:
+          "Failed to restore current changes, continue without...",
+        fn: async () => await $`git restore .`,
+        required: false,
+      },
+
+      {
+        description:
+          "Update repo and remove remote tracking branches / tags that was removed",
+        errorMessageOnFailure: "Failed to update repo",
+        fn: async () => await $`git pull --prune --no-tags --ff-only`,
+      },
+
+      {
+        description:
+          "Update repo and remove remote tracking branches / tags that was removed",
+        errorMessageOnFailure: "Failed to update repo",
+        fn: async () => await $`git pull --prune --no-tags --ff-only`,
+      },
+
+      {
+        description: "Remove Local branches that does not exist on the remote",
+        steps: [
+          {
+            description:
+              "Remove all remote-tracking references that no longer exist on the remote",
+            errorMessageOnFailure: "Failed to run fetch",
+
+            // Remove all remote-tracking references that no longer exist on the remote and then fetch (so we can know which branches their remote is deleted delete)
+            fn: async () => await $`git fetch -p`,
+          },
+          {
+            description: "Remove local branches without remote reference",
+            errorMessageOnFailure:
+              "Failed to remove local branches that not exists on the remote",
+
+            fn: async () => {
+              // The format should look something like this:
+              // [gone] ### BRNGG-16532-update-dashboard-sdk-and-frontend-utils
+              // [behind 8] ### edge
+              //  ### master
+              const separator = "####";
+              const { stdout: remoteStateForEachBranch } =
+                await $`git branch -vv --format '%(upstream:track) ${separator} %(refname:short)'`;
+
+              const allBranchNamesToDelete = remoteStateForEachBranch
+                .split("\n")
+                .map((stateWithBranch) => stateWithBranch.split(separator))
+
+                // Gone are for branches that their remote deleted
+                .filter(([state]) => state.trim() === "[gone]")
+                .map(([_, branchName]) => branchName.trim());
+
+              if (allBranchNamesToDelete.length) {
+                await $`git branch -D ${allBranchNamesToDelete}`;
+              }
+            },
+          },
+        ],
+      },
+    ]);
   });
 }
 
@@ -207,14 +365,14 @@ async function cloneGitRepo({ fullName, fullPath }) {
 
     console.error(e);
 
-    return;
+    return "Failed to clone";
   }
 
   await within(async () => {
     cd(fullPath);
 
     try {
-      console.log("checking if have git submodules");
+      verbose && console.log("checking if have git submodules");
 
       const { stdout: status } = await $`git submodule status --recursive`;
 
@@ -223,7 +381,7 @@ async function cloneGitRepo({ fullName, fullPath }) {
         return;
       }
 
-      print(`${fullName} Have submodule, init...`);
+      verbose && console.log(`${fullName} Have submodule, init...`);
       await $`git submodule update --init --recursive`;
     } catch (e) {
       console.log(
@@ -232,6 +390,197 @@ async function cloneGitRepo({ fullName, fullPath }) {
         ),
         e
       );
+
+      return "Failed to check/update git sub module repo\n" + e.message;
     }
   });
+}
+
+const NO_OP = () => {};
+
+async function strictQuestion(
+  msg,
+  choices,
+  { printOptionsInMsg = true, answerInNewLine = true, ignoreCase = false } = {}
+) {
+  let result;
+
+  let choicesToCmp = ignoreCase
+    ? choices.map((choice) =>
+        typeof choice === "string" ? choice.toLowerCase() : choice
+      )
+    : choices;
+
+  do {
+    if (result !== undefined) {
+      console.log(
+        chalk.red(
+          `You must select one of those options: ${choices}. You selected: ${result}`
+        )
+      );
+    }
+
+    result = await question(
+      msg +
+        (printOptionsInMsg ? ` (options: ${choices.join(", ")})` : "") +
+        (answerInNewLine ? ":\n" : ": "),
+      { choices }
+    );
+  } while (!choicesToCmp.includes(ignoreCase ? result.toLowerCase() : result));
+
+  return result;
+}
+
+async function confirm(
+  msg,
+  {
+    onNo = NO_OP,
+    onYes = NO_OP,
+    exitOnNo = true,
+    exitCode = 1,
+    ...strictQuestionOptions
+  } = {}
+) {
+  const result = await strictQuestion(msg, ["Y", "n"], {
+    answerInNewLine: false,
+    ...strictQuestionOptions,
+    ignoreCase: true,
+  });
+
+  if (result.toLowerCase() === "n") {
+    await onNo();
+
+    if (exitOnNo) {
+      console.log(chalk.red("Exiting..."));
+      process.exit(exitCode);
+    }
+
+    return;
+  }
+
+  await onYes();
+}
+
+function getOptionUntilTop(options, name, defaultValue = undefined) {
+  const alreadyVisit = new WeakSet();
+  while (options && options[name] == null) {
+    if (alreadyVisit.has(options)) {
+      throw new Error(
+        "Found parent options cyclic dependency when trying to get: " + name
+      );
+    }
+
+    alreadyVisit.add(options);
+    options = options.parentOptions;
+  }
+
+  let value = options?.[name];
+
+  if (value == null) {
+    value = defaultValue;
+  }
+
+  return value;
+}
+
+async function runSteps(context, steps, parentOptions) {
+  for (let step of steps) {
+    if (typeof step === "function") {
+      step = { fn: step, require: true, skip: false };
+    }
+
+    const { fn, ...options } = step;
+
+    if (options.skip == null) {
+      options.skip = false;
+    }
+    if (options.required == null) {
+      options.required = true;
+    }
+
+    if (parentOptions) {
+      options.parentOptions = parentOptions;
+    }
+
+    options.padding = getOptionUntilTop(options, "padding", -1) + 1;
+    options.skipFlag = getOptionUntilTop(options, "skipFlag");
+
+    const {
+      skip,
+      padding,
+      skipFlag,
+      required,
+      steps: subSteps,
+      preSteps,
+      description,
+      errorMessageOnFailure,
+    } = options;
+
+    if (skip) {
+      continue;
+    }
+
+    if (description) {
+      verbose && console.log();
+      verbose && console.log(`[${context.projectName}] ${description}`);
+    }
+
+    if (subSteps) {
+      if (preSteps) {
+        await preSteps(context);
+      }
+
+      const res = await runSteps(context, subSteps, options);
+
+      if (res) {
+        return res;
+      }
+
+      continue;
+    }
+
+    try {
+      await fn(context);
+    } catch (e) {
+      let appendErrorMessage = true;
+      let errorMessage = errorMessageOnFailure;
+
+      if (!errorMessage && description) {
+        errorMessage = `Failed ${description}`;
+      }
+
+      if (!errorMessage) {
+        appendErrorMessage = false;
+        errorMessage = e.message;
+      }
+
+      if (skipFlag) {
+        errorMessage += ` (to skip this pass \`${skipFlag}\`)`;
+      }
+
+      if (required) {
+        errorMessage += " aborting...";
+      } else {
+        errorMessage += " continue without...";
+      }
+
+      const messageToLog = chalk.red(
+        `${padding || ""}[${context.projectName}] ${errorMessage}`
+      );
+
+      if (appendErrorMessage) {
+        console.log(messageToLog, e.message);
+      } else {
+        console.log(messageToLog);
+      }
+
+      if (required) {
+        if (appendErrorMessage) {
+          errorMessage += `\n${e.message}`;
+        }
+
+        return errorMessage;
+      }
+    }
+  }
 }
